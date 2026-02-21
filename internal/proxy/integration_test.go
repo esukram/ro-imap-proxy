@@ -188,6 +188,125 @@ func (e *integrationEnv) noUpstream(t *testing.T) {
 	}
 }
 
+// readUntilTagged reads response lines until a tagged response (starting with tag + space) is seen.
+func (e *integrationEnv) readUntilTagged(t *testing.T, tag string) []string {
+	t.Helper()
+	var lines []string
+	for {
+		line := e.readLine(t)
+		lines = append(lines, line)
+		if strings.HasPrefix(line, tag+" ") {
+			return lines
+		}
+	}
+}
+
+// folderListResponses are the LIST responses sent by the folder-filter fake upstream.
+var folderListResponses = []string{
+	`* LIST (\HasNoChildren) "/" "INBOX"`,
+	`* LIST (\HasNoChildren) "/" "Sent"`,
+	`* LIST (\HasNoChildren) "/" "Drafts"`,
+	`* LIST (\HasChildren) "/" "Archive"`,
+	`* LIST (\HasNoChildren) "/" "Archive/2024"`,
+	`* LIST (\HasNoChildren) "/" "Trash"`,
+	`* LIST (\HasNoChildren) "/" "Spam"`,
+}
+
+// newFolderFilterEnv creates a proxy session with a fake upstream that responds
+// to LIST/LSUB with realistic folder listing responses. The modify function
+// (if non-nil) can adjust the account config before the session starts.
+func newFolderFilterEnv(t *testing.T, modify func(*config.AccountConfig)) *integrationEnv {
+	t.Helper()
+
+	clientConn, proxyConn := net.Pipe()
+	upClient, upServer := net.Pipe()
+	received := make(chan string, 100)
+
+	// Fake upstream goroutine.
+	go func() {
+		defer upServer.Close()
+		sr := bufio.NewReader(upServer)
+
+		// Greeting.
+		fmt.Fprint(upServer, "* OK Fake IMAP server ready\r\n")
+
+		// LOGIN.
+		line, err := sr.ReadString('\n')
+		if err != nil {
+			return
+		}
+		received <- strings.TrimRight(line, "\r\n")
+		if strings.Contains(strings.ToUpper(line), "LOGIN") {
+			fmt.Fprint(upServer, "proxy0 OK LOGIN completed\r\n")
+		} else {
+			fmt.Fprint(upServer, "proxy0 NO unexpected command\r\n")
+		}
+
+		// Post-auth command loop.
+		for {
+			line, err := sr.ReadString('\n')
+			if err != nil {
+				return
+			}
+			trimmed := strings.TrimRight(line, "\r\n")
+			received <- trimmed
+			parts := strings.SplitN(trimmed, " ", 2)
+			tag := parts[0]
+
+			upper := strings.ToUpper(trimmed)
+
+			switch {
+			case strings.Contains(upper, " LIST"):
+				for _, lr := range folderListResponses {
+					fmt.Fprintf(upServer, "%s\r\n", lr)
+				}
+				fmt.Fprintf(upServer, "%s OK LIST completed\r\n", tag)
+
+			case strings.Contains(upper, " LSUB"):
+				for _, lr := range folderListResponses {
+					lsub := strings.Replace(lr, "* LIST", "* LSUB", 1)
+					fmt.Fprintf(upServer, "%s\r\n", lsub)
+				}
+				fmt.Fprintf(upServer, "%s OK LSUB completed\r\n", tag)
+
+			case strings.Contains(upper, " LOGOUT"):
+				fmt.Fprintf(upServer, "* BYE server logging out\r\n")
+				fmt.Fprintf(upServer, "%s OK LOGOUT completed\r\n", tag)
+				return
+
+			default:
+				fmt.Fprintf(upServer, "%s OK completed\r\n", tag)
+			}
+		}
+	}()
+
+	cfg := testConfig()
+	if modify != nil {
+		modify(&cfg.Accounts[0])
+	}
+	sess := NewSession(proxyConn, cfg, testLogger())
+	sess.dialUpstream = func(acct *config.AccountConfig) (net.Conn, *bufio.Reader, error) {
+		r := bufio.NewReader(upClient)
+		// Consume greeting.
+		if _, err := r.ReadString('\n'); err != nil {
+			return nil, nil, err
+		}
+		return upClient, r, nil
+	}
+
+	go sess.Run()
+
+	env := &integrationEnv{
+		clientConn: clientConn,
+		clientR:    bufio.NewReader(clientConn),
+		received:   received,
+	}
+
+	clientConn.SetReadDeadline(time.Now().Add(10 * time.Second))
+
+	return env
+}
+
 // TestIntegrationFullSession tests a complete session lifecycle:
 // connect → greeting → capability → login → select(→examine rewrite) →
 // fetch → store(blocked) → logout
@@ -407,4 +526,159 @@ func TestIntegrationAllowedCommands(t *testing.T) {
 			t.Fatalf("expected OK for rewritten select, got: %q", resp)
 		}
 	})
+}
+
+// --- Folder filter integration tests ---
+
+func TestIntegrationFolderAllowList(t *testing.T) {
+	env := newFolderFilterEnv(t, func(a *config.AccountConfig) {
+		a.AllowedFolders = []string{"INBOX", "Sent"}
+	})
+	defer env.clientConn.Close()
+	env.login(t)
+
+	env.send(t, "A002 LIST \"\" *\r\n")
+	env.drainUpstream(t)
+
+	lines := env.readUntilTagged(t, "A002")
+
+	var folders []string
+	for _, line := range lines {
+		if strings.HasPrefix(line, "* LIST") {
+			folders = append(folders, line)
+		}
+	}
+	if len(folders) != 2 {
+		t.Fatalf("expected 2 folders, got %d: %v", len(folders), folders)
+	}
+	for _, f := range folders {
+		if !strings.Contains(f, "INBOX") && !strings.Contains(f, "Sent") {
+			t.Errorf("unexpected folder in response: %s", f)
+		}
+	}
+}
+
+func TestIntegrationFolderBlockList(t *testing.T) {
+	env := newFolderFilterEnv(t, func(a *config.AccountConfig) {
+		a.BlockedFolders = []string{"Spam", "Trash"}
+	})
+	defer env.clientConn.Close()
+	env.login(t)
+
+	env.send(t, "A002 LIST \"\" *\r\n")
+	env.drainUpstream(t)
+
+	lines := env.readUntilTagged(t, "A002")
+
+	var folders []string
+	for _, line := range lines {
+		if strings.HasPrefix(line, "* LIST") {
+			folders = append(folders, line)
+		}
+	}
+	// 7 total - 2 blocked = 5
+	if len(folders) != 5 {
+		t.Fatalf("expected 5 folders, got %d: %v", len(folders), folders)
+	}
+	for _, f := range folders {
+		if strings.Contains(f, "\"Spam\"") || strings.Contains(f, "\"Trash\"") {
+			t.Errorf("blocked folder in response: %s", f)
+		}
+	}
+}
+
+func TestIntegrationLsubFiltering(t *testing.T) {
+	env := newFolderFilterEnv(t, func(a *config.AccountConfig) {
+		a.BlockedFolders = []string{"Spam"}
+	})
+	defer env.clientConn.Close()
+	env.login(t)
+
+	env.send(t, "A002 LSUB \"\" *\r\n")
+	env.drainUpstream(t)
+
+	lines := env.readUntilTagged(t, "A002")
+
+	for _, line := range lines {
+		if strings.HasPrefix(line, "* LSUB") && strings.Contains(line, "\"Spam\"") {
+			t.Errorf("blocked folder in LSUB response: %s", line)
+		}
+	}
+
+	// Count unblocked LSUB responses: 7 - 1 = 6
+	count := 0
+	for _, line := range lines {
+		if strings.HasPrefix(line, "* LSUB") {
+			count++
+		}
+	}
+	if count != 6 {
+		t.Fatalf("expected 6 LSUB responses, got %d", count)
+	}
+}
+
+func TestIntegrationSelectBlockedFolder(t *testing.T) {
+	env := newFolderFilterEnv(t, func(a *config.AccountConfig) {
+		a.BlockedFolders = []string{"Trash"}
+	})
+	defer env.clientConn.Close()
+	env.login(t)
+
+	env.send(t, "A002 SELECT Trash\r\n")
+	resp := env.readLine(t)
+	if !strings.Contains(resp, "A002 NO") {
+		t.Fatalf("expected NO for blocked SELECT, got: %q", resp)
+	}
+	env.noUpstream(t)
+}
+
+func TestIntegrationExamineBlockedFolder(t *testing.T) {
+	env := newFolderFilterEnv(t, func(a *config.AccountConfig) {
+		a.BlockedFolders = []string{"Trash"}
+	})
+	defer env.clientConn.Close()
+	env.login(t)
+
+	env.send(t, "A002 EXAMINE Trash\r\n")
+	resp := env.readLine(t)
+	if !strings.Contains(resp, "A002 NO") {
+		t.Fatalf("expected NO for blocked EXAMINE, got: %q", resp)
+	}
+	env.noUpstream(t)
+}
+
+func TestIntegrationStatusBlockedFolder(t *testing.T) {
+	env := newFolderFilterEnv(t, func(a *config.AccountConfig) {
+		a.BlockedFolders = []string{"Trash"}
+	})
+	defer env.clientConn.Close()
+	env.login(t)
+
+	env.send(t, "A002 STATUS Trash (MESSAGES)\r\n")
+	resp := env.readLine(t)
+	if !strings.Contains(resp, "A002 NO") {
+		t.Fatalf("expected NO for blocked STATUS, got: %q", resp)
+	}
+	env.noUpstream(t)
+}
+
+func TestIntegrationNoFilterAllPassThrough(t *testing.T) {
+	env := newFolderFilterEnv(t, nil)
+	defer env.clientConn.Close()
+	env.login(t)
+
+	env.send(t, "A002 LIST \"\" *\r\n")
+	env.drainUpstream(t)
+
+	lines := env.readUntilTagged(t, "A002")
+
+	var folders []string
+	for _, line := range lines {
+		if strings.HasPrefix(line, "* LIST") {
+			folders = append(folders, line)
+		}
+	}
+	if len(folders) != 7 {
+		t.Fatalf("expected 7 folders (no filter), got %d: %v", len(folders), folders)
+	}
 }

@@ -127,6 +127,24 @@ remote_starttls = true
 			wantErr: true,
 		},
 		{
+			name: "conflicting folder lists",
+			content: `
+[server]
+listen = ":143"
+
+[[accounts]]
+local_user = "u1"
+local_password = "p1"
+remote_host = "h"
+remote_port = 143
+remote_user = "ru"
+remote_password = "rp"
+allowed_folders = ["INBOX"]
+blocked_folders = ["Trash"]
+`,
+			wantErr: true,
+		},
+		{
 			name: "no TLS flags both false is valid",
 			content: `
 [server]
@@ -206,6 +224,64 @@ func TestLookupUser(t *testing.T) {
 			}
 			if got.LocalUser != tt.wantUser {
 				t.Errorf("LookupUser(%q).LocalUser = %q, want %q", tt.username, got.LocalUser, tt.wantUser)
+			}
+		})
+	}
+}
+
+func TestHasFolderFilter(t *testing.T) {
+	tests := []struct {
+		name string
+		acct AccountConfig
+		want bool
+	}{
+		{"no filter", AccountConfig{}, false},
+		{"allow list", AccountConfig{AllowedFolders: []string{"INBOX"}}, true},
+		{"block list", AccountConfig{BlockedFolders: []string{"Trash"}}, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.acct.HasFolderFilter(); got != tt.want {
+				t.Errorf("HasFolderFilter() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFolderAllowed(t *testing.T) {
+	tests := []struct {
+		name   string
+		acct   AccountConfig
+		folder string
+		want   bool
+	}{
+		// Allow-list tests.
+		{"allow exact match", AccountConfig{AllowedFolders: []string{"INBOX", "Sent"}}, "INBOX", true},
+		{"allow no match", AccountConfig{AllowedFolders: []string{"INBOX", "Sent"}}, "Trash", false},
+		{"allow child match slash", AccountConfig{AllowedFolders: []string{"Archive"}}, "Archive/2024", true},
+		{"allow child match dot", AccountConfig{AllowedFolders: []string{"Archive"}}, "Archive.2024", true},
+		{"allow parent not matched by child entry", AccountConfig{AllowedFolders: []string{"Archive/2024"}}, "Archive", false},
+
+		// Block-list tests.
+		{"block exact match", AccountConfig{BlockedFolders: []string{"Spam", "Trash"}}, "Spam", false},
+		{"block no match allowed", AccountConfig{BlockedFolders: []string{"Spam", "Trash"}}, "INBOX", true},
+		{"block child match", AccountConfig{BlockedFolders: []string{"Trash"}}, "Trash/Subfolder", false},
+
+		// INBOX case insensitivity.
+		{"inbox case insensitive allow", AccountConfig{AllowedFolders: []string{"inbox"}}, "INBOX", true},
+		{"inbox case insensitive block", AccountConfig{BlockedFolders: []string{"inbox"}}, "INBOX", false},
+		{"inbox case insensitive name", AccountConfig{AllowedFolders: []string{"INBOX"}}, "inbox", true},
+
+		// No filter.
+		{"no filter", AccountConfig{}, "Anything", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.acct.FolderAllowed(tt.folder)
+			if got != tt.want {
+				t.Errorf("FolderAllowed(%q) = %v, want %v", tt.folder, got, tt.want)
 			}
 		})
 	}

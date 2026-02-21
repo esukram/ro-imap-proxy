@@ -172,19 +172,44 @@ func (s *Session) runPostAuth() {
 
 	done := make(chan struct{})
 
-	// Upstream→Client goroutine.
+	// Upstream→Client goroutine: line-based reading with optional LIST/LSUB filtering.
 	go func() {
 		defer func() {
 			cleanup()
 			close(done)
 		}()
-		buf := make([]byte, 4096)
 		for {
-			n, err := s.upstreamR.Read(buf)
-			if n > 0 {
-				if _, wErr := s.clientConn.Write(buf[:n]); wErr != nil {
-					s.logger.Debug("write to client failed", "err", wErr)
-					return
+			line, err := s.upstreamR.ReadString('\n')
+			if len(line) > 0 {
+				filtered := false
+				if s.account.HasFolderFilter() {
+					if mailbox, ok := imap.ParseListResponse([]byte(line)); ok {
+						if !s.account.FolderAllowed(mailbox) {
+							filtered = true
+						}
+					}
+				}
+
+				if !filtered {
+					if _, wErr := io.WriteString(s.clientConn, line); wErr != nil {
+						s.logger.Debug("write to client failed", "err", wErr)
+						return
+					}
+				}
+
+				// Handle server-side literals.
+				n, _, hasLiteral := imap.ParseLiteral([]byte(line))
+				if hasLiteral {
+					if filtered {
+						if _, dErr := io.CopyN(io.Discard, s.upstreamR, n); dErr != nil {
+							return
+						}
+					} else {
+						if _, cErr := io.CopyN(s.clientConn, s.upstreamR, n); cErr != nil {
+							s.logger.Debug("copy upstream literal failed", "err", cErr)
+							return
+						}
+					}
 				}
 			}
 			if err != nil {
@@ -241,6 +266,10 @@ func (s *Session) clientToUpstream() {
 		result := imap.Filter(cmd)
 		switch result.Action {
 		case imap.Allow:
+			if s.folderBlocked(cmd) {
+				fmt.Fprintf(s.clientConn, "%s NO folder not available\r\n", cmd.Tag)
+				continue
+			}
 			if err := s.forwardWithLiterals([]byte(line)); err != nil {
 				return
 			}
@@ -255,6 +284,10 @@ func (s *Session) clientToUpstream() {
 			}
 
 		case imap.Rewrite:
+			if s.folderBlocked(cmd) {
+				fmt.Fprintf(s.clientConn, "%s NO folder not available\r\n", cmd.Tag)
+				continue
+			}
 			s.logger.Debug("rewritten command", "verb", cmd.Verb)
 			if err := s.forwardWithLiterals(result.Rewritten); err != nil {
 				return
@@ -318,6 +351,39 @@ func (s *Session) forwardWithLiterals(line []byte) error {
 		}
 		line = []byte(nextLine)
 	}
+}
+
+// folderBlocked checks if the command targets a folder that is hidden by the
+// account's folder filter. Returns true if the command should be rejected.
+func (s *Session) folderBlocked(cmd imap.Command) bool {
+	if !s.account.HasFolderFilter() {
+		return false
+	}
+	switch cmd.Verb {
+	case "SELECT", "EXAMINE", "STATUS":
+	default:
+		return false
+	}
+	mailbox := extractCommandMailbox(cmd)
+	if mailbox == "" {
+		return false
+	}
+	return !s.account.FolderAllowed(mailbox)
+}
+
+// extractCommandMailbox extracts the mailbox name argument from commands
+// like SELECT, EXAMINE, or STATUS.
+func extractCommandMailbox(cmd imap.Command) string {
+	raw := strings.TrimRight(string(cmd.Raw), "\r\n")
+	parts := strings.SplitN(raw, " ", 3)
+	if len(parts) < 3 {
+		return ""
+	}
+	mailbox, _, err := parseOneArg(parts[2])
+	if err != nil {
+		return ""
+	}
+	return mailbox
 }
 
 // parseLoginArgs parses the arguments to a LOGIN command.

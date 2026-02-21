@@ -10,3 +10,7 @@ remote_user = "realuser@example.com"
 remote_password = "realpass"
 remote_tls = true
 # remote_starttls = true  # mutually exclusive with remote_tls
+
+# Folder visibility (only one of these may be set per account):
+# allowed_folders = ["INBOX", "Sent"]    # only these folders visible
+# blocked_folders = ["Spam", "Trash"]    # these folders hidden
