@@ -1,0 +1,12 @@
+[server]
+listen = ":143"
+
+[[accounts]]
+local_user = "reader1"
+local_password = "localpass1"
+remote_host = "mail.example.com"
+remote_port = 993
+remote_user = "realuser@example.com"
+remote_password = "realpass"
+remote_tls = true
+# remote_starttls = true  # mutually exclusive with remote_tls

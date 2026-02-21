@@ -1,0 +1,403 @@
+package proxy
+
+import (
+	"bufio"
+	"fmt"
+	"net"
+	"strings"
+	"testing"
+	"time"
+
+	"ro-imap-proxy/internal/config"
+)
+
+// integrationEnv holds the common state for an integration test session.
+type integrationEnv struct {
+	clientConn net.Conn
+	clientR    *bufio.Reader
+	received   chan string // commands received by the fake upstream
+}
+
+// newIntegrationEnv creates a proxy session backed by a fake IMAP upstream.
+// The fake upstream accepts LOGIN, echoes "tag OK" for regular commands,
+// handles IDLE (sends "+", waits for DONE), and handles LOGOUT.
+// All commands received by the upstream are sent to the received channel.
+func newIntegrationEnv(t *testing.T) *integrationEnv {
+	t.Helper()
+
+	clientConn, proxyConn := net.Pipe()
+	upClient, upServer := net.Pipe()
+	received := make(chan string, 100)
+
+	// Fake upstream goroutine.
+	go func() {
+		defer upServer.Close()
+		sr := bufio.NewReader(upServer)
+
+		// Greeting (consumed by the injected DialUpstream).
+		fmt.Fprint(upServer, "* OK Fake IMAP server ready\r\n")
+
+		// LOGIN.
+		line, err := sr.ReadString('\n')
+		if err != nil {
+			return
+		}
+		received <- strings.TrimRight(line, "\r\n")
+		if strings.Contains(strings.ToUpper(line), "LOGIN") {
+			fmt.Fprint(upServer, "proxy0 OK LOGIN completed\r\n")
+		} else {
+			fmt.Fprint(upServer, "proxy0 NO unexpected command\r\n")
+		}
+
+		// Post-auth command loop.
+		for {
+			line, err := sr.ReadString('\n')
+			if err != nil {
+				return
+			}
+			trimmed := strings.TrimRight(line, "\r\n")
+			received <- trimmed
+			parts := strings.SplitN(trimmed, " ", 2)
+			tag := parts[0]
+
+			upper := strings.ToUpper(trimmed)
+
+			switch {
+			case strings.Contains(upper, " IDLE"):
+				fmt.Fprintf(upServer, "+ idling\r\n")
+				// Wait for DONE.
+				for {
+					dl, err := sr.ReadString('\n')
+					if err != nil {
+						return
+					}
+					if strings.EqualFold(strings.TrimRight(dl, "\r\n"), "DONE") {
+						fmt.Fprintf(upServer, "%s OK IDLE terminated\r\n", tag)
+						break
+					}
+				}
+
+			case strings.Contains(upper, " LOGOUT"):
+				fmt.Fprintf(upServer, "* BYE server logging out\r\n")
+				fmt.Fprintf(upServer, "%s OK LOGOUT completed\r\n", tag)
+				return
+
+			default:
+				fmt.Fprintf(upServer, "%s OK completed\r\n", tag)
+			}
+		}
+	}()
+
+	cfg := testConfig()
+	sess := NewSession(proxyConn, cfg, testLogger())
+	sess.dialUpstream = func(acct *config.AccountConfig) (net.Conn, *bufio.Reader, error) {
+		r := bufio.NewReader(upClient)
+		// Consume greeting, like real DialUpstream does.
+		if _, err := r.ReadString('\n'); err != nil {
+			return nil, nil, err
+		}
+		return upClient, r, nil
+	}
+
+	go sess.Run()
+
+	env := &integrationEnv{
+		clientConn: clientConn,
+		clientR:    bufio.NewReader(clientConn),
+		received:   received,
+	}
+
+	// Set a generous deadline for all reads.
+	clientConn.SetReadDeadline(time.Now().Add(10 * time.Second))
+
+	return env
+}
+
+// login reads the greeting, sends LOGIN, and verifies success.
+func (e *integrationEnv) login(t *testing.T) {
+	t.Helper()
+
+	// Read greeting.
+	greeting := e.readLine(t)
+	if !strings.Contains(greeting, "* OK ro-imap-proxy ready") {
+		t.Fatalf("unexpected greeting: %q", greeting)
+	}
+
+	// Send LOGIN.
+	e.send(t, "A001 LOGIN reader1 localpass1\r\n")
+
+	// Drain LOGIN from upstream received channel.
+	e.drainUpstream(t)
+
+	// Read LOGIN OK.
+	resp := e.readLine(t)
+	if !strings.Contains(resp, "A001 OK LOGIN") {
+		t.Fatalf("expected LOGIN OK, got: %q", resp)
+	}
+}
+
+func (e *integrationEnv) send(t *testing.T, data string) {
+	t.Helper()
+	if _, err := fmt.Fprint(e.clientConn, data); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+}
+
+func (e *integrationEnv) readLine(t *testing.T) string {
+	t.Helper()
+	line, err := e.clientR.ReadString('\n')
+	if err != nil {
+		t.Fatalf("readLine: %v", err)
+	}
+	return line
+}
+
+// expectUpstream waits for a command on the received channel containing substring.
+func (e *integrationEnv) expectUpstream(t *testing.T, substring string) string {
+	t.Helper()
+	select {
+	case cmd := <-e.received:
+		if !strings.Contains(strings.ToUpper(cmd), strings.ToUpper(substring)) {
+			t.Fatalf("expected upstream command containing %q, got: %q", substring, cmd)
+		}
+		return cmd
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timeout waiting for upstream command containing %q", substring)
+		return ""
+	}
+}
+
+// drainUpstream reads and discards one item from the received channel.
+func (e *integrationEnv) drainUpstream(t *testing.T) {
+	t.Helper()
+	select {
+	case <-e.received:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout draining upstream command")
+	}
+}
+
+// noUpstream verifies nothing was sent to upstream within a short window.
+func (e *integrationEnv) noUpstream(t *testing.T) {
+	t.Helper()
+	select {
+	case cmd := <-e.received:
+		t.Fatalf("unexpected upstream command: %q", cmd)
+	case <-time.After(50 * time.Millisecond):
+		// Good — nothing sent to upstream.
+	}
+}
+
+// TestIntegrationFullSession tests a complete session lifecycle:
+// connect → greeting → capability → login → select(→examine rewrite) →
+// fetch → store(blocked) → logout
+func TestIntegrationFullSession(t *testing.T) {
+	env := newIntegrationEnv(t)
+	defer env.clientConn.Close()
+
+	// 1. Read greeting.
+	greeting := env.readLine(t)
+	if !strings.Contains(greeting, "* OK ro-imap-proxy ready") {
+		t.Fatalf("unexpected greeting: %q", greeting)
+	}
+
+	// 2. CAPABILITY (pre-auth, handled locally).
+	env.send(t, "A001 CAPABILITY\r\n")
+	capLine := env.readLine(t)
+	if !strings.Contains(capLine, "CAPABILITY IMAP4rev1") {
+		t.Fatalf("expected CAPABILITY response, got: %q", capLine)
+	}
+	if !strings.Contains(capLine, "IDLE") {
+		t.Fatalf("expected IDLE in capabilities, got: %q", capLine)
+	}
+	capOK := env.readLine(t)
+	if !strings.Contains(capOK, "A001 OK") {
+		t.Fatalf("expected CAPABILITY OK, got: %q", capOK)
+	}
+
+	// 3. LOGIN.
+	env.send(t, "A002 LOGIN reader1 localpass1\r\n")
+	env.drainUpstream(t) // drain upstream LOGIN
+	loginResp := env.readLine(t)
+	if !strings.Contains(loginResp, "A002 OK LOGIN") {
+		t.Fatalf("expected LOGIN OK, got: %q", loginResp)
+	}
+
+	// 4. SELECT INBOX → rewritten to EXAMINE.
+	env.send(t, "A003 SELECT INBOX\r\n")
+	upCmd := env.expectUpstream(t, "EXAMINE")
+	if strings.Contains(upCmd, "SELECT") {
+		t.Fatalf("SELECT should have been rewritten to EXAMINE, got: %q", upCmd)
+	}
+	selResp := env.readLine(t)
+	if !strings.Contains(selResp, "A003 OK") {
+		t.Fatalf("expected SELECT/EXAMINE OK, got: %q", selResp)
+	}
+
+	// 5. FETCH (allowed, forwarded to upstream).
+	env.send(t, "A004 FETCH 1:* (FLAGS)\r\n")
+	env.expectUpstream(t, "FETCH")
+	fetchResp := env.readLine(t)
+	if !strings.Contains(fetchResp, "A004 OK") {
+		t.Fatalf("expected FETCH OK, got: %q", fetchResp)
+	}
+
+	// 6. STORE (blocked, rejected locally).
+	env.send(t, "A005 STORE 1 +FLAGS (\\Seen)\r\n")
+	storeResp := env.readLine(t)
+	if !strings.Contains(storeResp, "A005 NO") || !strings.Contains(storeResp, "not allowed") {
+		t.Fatalf("expected STORE rejection, got: %q", storeResp)
+	}
+	env.noUpstream(t) // STORE must not reach upstream
+
+	// 7. Verify session still works after a blocked command.
+	env.send(t, "A006 NOOP\r\n")
+	env.expectUpstream(t, "NOOP")
+	noopResp := env.readLine(t)
+	if !strings.Contains(noopResp, "A006 OK") {
+		t.Fatalf("expected NOOP OK, got: %q", noopResp)
+	}
+
+	// 8. LOGOUT.
+	env.send(t, "A007 LOGOUT\r\n")
+	env.expectUpstream(t, "LOGOUT")
+}
+
+// TestIntegrationBlockedCommands tests ALL blocked commands from the spec.
+func TestIntegrationBlockedCommands(t *testing.T) {
+	blockedCmds := []struct {
+		name string
+		cmd  string
+	}{
+		{"STORE", "STORE 1 +FLAGS (\\Seen)"},
+		{"COPY", "COPY 1 Trash"},
+		{"MOVE", "MOVE 1 Trash"},
+		{"DELETE", "DELETE MyFolder"},
+		{"EXPUNGE", "EXPUNGE"},
+		{"APPEND", "APPEND INBOX {10}"},
+		{"CREATE", "CREATE NewFolder"},
+		{"RENAME", "RENAME OldFolder NewFolder"},
+		{"SUBSCRIBE", "SUBSCRIBE INBOX"},
+		{"UNSUBSCRIBE", "UNSUBSCRIBE INBOX"},
+		{"AUTHENTICATE", "AUTHENTICATE PLAIN"},
+	}
+
+	env := newIntegrationEnv(t)
+	defer env.clientConn.Close()
+	env.login(t)
+
+	for i, tc := range blockedCmds {
+		t.Run(tc.name, func(t *testing.T) {
+			tag := fmt.Sprintf("B%03d", i+1)
+			env.send(t, fmt.Sprintf("%s %s\r\n", tag, tc.cmd))
+
+			resp := env.readLine(t)
+			if !strings.Contains(resp, tag+" NO") {
+				t.Fatalf("expected %s NO rejection, got: %q", tag, resp)
+			}
+			if !strings.Contains(resp, "not allowed") {
+				t.Fatalf("expected 'not allowed' in rejection, got: %q", resp)
+			}
+		})
+	}
+
+	// Verify session is still alive after all blocked commands.
+	env.send(t, "B999 NOOP\r\n")
+	env.expectUpstream(t, "NOOP")
+	noopResp := env.readLine(t)
+	if !strings.Contains(noopResp, "B999 OK") {
+		t.Fatalf("expected NOOP OK after blocked commands, got: %q", noopResp)
+	}
+}
+
+// TestIntegrationUIDBlockedCommands tests blocked UID subcommands.
+func TestIntegrationUIDBlockedCommands(t *testing.T) {
+	blockedUIDs := []struct {
+		name string
+		cmd  string
+	}{
+		{"UID STORE", "UID STORE 1:* FLAGS (\\Seen)"},
+		{"UID COPY", "UID COPY 1:* Trash"},
+		{"UID MOVE", "UID MOVE 1:* Trash"},
+		{"UID EXPUNGE", "UID EXPUNGE 1:*"},
+	}
+
+	env := newIntegrationEnv(t)
+	defer env.clientConn.Close()
+	env.login(t)
+
+	for i, tc := range blockedUIDs {
+		t.Run(tc.name, func(t *testing.T) {
+			tag := fmt.Sprintf("U%03d", i+1)
+			env.send(t, fmt.Sprintf("%s %s\r\n", tag, tc.cmd))
+
+			resp := env.readLine(t)
+			if !strings.Contains(resp, tag+" NO") {
+				t.Fatalf("expected %s NO rejection, got: %q", tag, resp)
+			}
+			if !strings.Contains(resp, "not allowed") {
+				t.Fatalf("expected 'not allowed' in rejection, got: %q", resp)
+			}
+		})
+	}
+
+	// Verify allowed UID subcommands still work.
+	env.send(t, "U100 UID FETCH 1:* (FLAGS)\r\n")
+	env.expectUpstream(t, "UID FETCH")
+	fetchResp := env.readLine(t)
+	if !strings.Contains(fetchResp, "U100 OK") {
+		t.Fatalf("expected UID FETCH OK, got: %q", fetchResp)
+	}
+}
+
+// TestIntegrationAllowedCommands tests various allowed commands pass through to upstream.
+func TestIntegrationAllowedCommands(t *testing.T) {
+	allowedCmds := []struct {
+		name     string
+		cmd      string
+		upstream string // substring expected in the upstream command
+	}{
+		{"FETCH", "FETCH 1:* (FLAGS)", "FETCH"},
+		{"LIST", `LIST "" *`, "LIST"},
+		{"LSUB", `LSUB "" *`, "LSUB"},
+		{"STATUS", "STATUS INBOX (MESSAGES)", "STATUS"},
+		{"SEARCH", "SEARCH ALL", "SEARCH"},
+		{"NOOP", "NOOP", "NOOP"},
+		{"CAPABILITY", "CAPABILITY", "CAPABILITY"},
+		{"CHECK", "CHECK", "CHECK"},
+		{"CLOSE", "CLOSE", "CLOSE"},
+		{"EXAMINE", "EXAMINE INBOX", "EXAMINE"},
+		{"UID FETCH", "UID FETCH 1:* (FLAGS)", "UID FETCH"},
+		{"UID SEARCH", "UID SEARCH ALL", "UID SEARCH"},
+	}
+
+	env := newIntegrationEnv(t)
+	defer env.clientConn.Close()
+	env.login(t)
+
+	for i, tc := range allowedCmds {
+		t.Run(tc.name, func(t *testing.T) {
+			tag := fmt.Sprintf("D%03d", i+1)
+			env.send(t, fmt.Sprintf("%s %s\r\n", tag, tc.cmd))
+
+			env.expectUpstream(t, tc.upstream)
+			resp := env.readLine(t)
+			if !strings.Contains(resp, tag+" OK") {
+				t.Fatalf("expected %s OK, got: %q", tag, resp)
+			}
+		})
+	}
+
+	// Also test that lowercase select is rewritten and forwarded.
+	t.Run("lowercase select rewrite", func(t *testing.T) {
+		env.send(t, "D100 select INBOX\r\n")
+		upCmd := env.expectUpstream(t, "EXAMINE")
+		if strings.Contains(strings.ToUpper(upCmd), "SELECT") {
+			t.Fatalf("lowercase select should be rewritten to EXAMINE, got: %q", upCmd)
+		}
+		resp := env.readLine(t)
+		if !strings.Contains(resp, "D100 OK") {
+			t.Fatalf("expected OK for rewritten select, got: %q", resp)
+		}
+	})
+}
