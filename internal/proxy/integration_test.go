@@ -258,9 +258,16 @@ func TestIntegrationFullSession(t *testing.T) {
 		t.Fatalf("expected NOOP OK, got: %q", noopResp)
 	}
 
-	// 8. LOGOUT.
+	// 8. LOGOUT (handled locally by proxy, not forwarded to upstream).
 	env.send(t, "A007 LOGOUT\r\n")
-	env.expectUpstream(t, "LOGOUT")
+	bye := env.readLine(t)
+	if !strings.Contains(bye, "BYE") {
+		t.Fatalf("expected BYE, got: %q", bye)
+	}
+	logoutOK := env.readLine(t)
+	if !strings.Contains(logoutOK, "A007 OK LOGOUT") {
+		t.Fatalf("expected OK LOGOUT, got: %q", logoutOK)
+	}
 }
 
 // TestIntegrationBlockedCommands tests ALL blocked commands from the spec.

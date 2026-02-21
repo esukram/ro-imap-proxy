@@ -231,9 +231,10 @@ func (s *Session) clientToUpstream() {
 			continue
 		}
 
-		// Handle LOGOUT in post-auth.
+		// Handle LOGOUT in post-auth: respond locally and let cleanup close upstream.
 		if cmd.Verb == "LOGOUT" {
-			fmt.Fprint(s.upstreamConn, line)
+			fmt.Fprintf(s.clientConn, "* BYE ro-imap-proxy logging out\r\n")
+			fmt.Fprintf(s.clientConn, "%s OK LOGOUT completed\r\n", cmd.Tag)
 			return
 		}
 

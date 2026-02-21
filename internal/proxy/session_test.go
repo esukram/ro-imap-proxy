@@ -263,6 +263,28 @@ func TestSessionLoginUnknownUser(t *testing.T) {
 	clientConn.Close()
 }
 
+func TestSessionPostAuthLogout(t *testing.T) {
+	clientConn, r, _ := loginSession(t)
+	defer clientConn.Close()
+
+	fmt.Fprint(clientConn, "A002 LOGOUT\r\n")
+
+	line1, err := readLine(r)
+	if err != nil {
+		t.Fatalf("read BYE: %v", err)
+	}
+	if !strings.Contains(line1, "BYE") {
+		t.Fatalf("expected BYE, got: %q", line1)
+	}
+	line2, err := readLine(r)
+	if err != nil {
+		t.Fatalf("read OK LOGOUT: %v", err)
+	}
+	if !strings.Contains(line2, "A002 OK LOGOUT") {
+		t.Fatalf("expected A002 OK LOGOUT, got: %q", line2)
+	}
+}
+
 func TestSessionBlockedCommand(t *testing.T) {
 	clientConn, r, _ := loginSession(t)
 	defer clientConn.Close()
