@@ -6,7 +6,7 @@ import (
 	"net"
 	"sync"
 
-	"ro-imap-proxy/internal/config"
+	"imap-proxy/internal/config"
 )
 
 // Server listens for incoming client connections and spawns sessions.

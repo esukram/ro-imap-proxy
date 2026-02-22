@@ -3,7 +3,7 @@
 ## Build & test
 
 ```
-go build ./cmd/ro-imap-proxy/
+go build ./cmd/imap-proxy/
 go test ./...
 go vet ./...
 ```
@@ -13,7 +13,7 @@ Run a single package's tests: `go test ./internal/proxy/ -v -count=1`
 ## Project structure
 
 ```
-cmd/ro-imap-proxy/main.go     Entry point, flags, signal handling
+cmd/imap-proxy/main.go     Entry point, flags, signal handling
 internal/
   config/                      TOML config loading and account lookup
   imap/                        IMAP command parsing, literal detection, default read-only filter

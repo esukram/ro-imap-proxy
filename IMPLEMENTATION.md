@@ -1,4 +1,4 @@
-# Implementation Guide: ro-imap-proxy
+# Implementation Guide: imap-proxy
 
 ## Overview
 
@@ -13,7 +13,7 @@ Client (plaintext, port 143)
   │
   ▼
 ┌──────────────────────────────┐
-│ ro-imap-proxy                │
+│ imap-proxy                │
 │                              │
 │ Pre-auth:                    │
 │   CAPABILITY/NOOP → local    │
@@ -35,7 +35,7 @@ Remote IMAP Server (TLS/STARTTLS, port 993/143)
 ## Project Structure
 
 ```
-cmd/ro-imap-proxy/main.go          — entry point: flags, config load, start server
+cmd/imap-proxy/main.go          — entry point: flags, config load, start server
 internal/
   config/
     config.go                      — Config, ServerConfig, AccountConfig types; Load(); LookupUser()
@@ -187,7 +187,7 @@ type Server struct {
 
 ## Session Lifecycle
 
-1. **Greeting**: send `* OK ro-imap-proxy ready\r\n`
+1. **Greeting**: send `* OK imap-proxy ready\r\n`
 2. **Pre-auth loop**: read client commands, handle locally:
    - `CAPABILITY` → respond with hardcoded list (IMAP4rev1, IDLE, etc.; no STARTTLS advertised)
    - `NOOP` → `tag OK`
@@ -276,7 +276,7 @@ For blocked commands (e.g., APPEND with a literal): reject at the first line. Fo
 5. `internal/proxy/upstream.go` — dial + login, tests
 6. `internal/proxy/session.go` — core session logic (biggest piece, ~300 lines)
 7. `internal/proxy/server.go` — TCP accept loop
-8. `cmd/ro-imap-proxy/main.go` — wire everything
+8. `cmd/imap-proxy/main.go` — wire everything
 9. `config.example.toml`
 10. `README.md`
 11. `CLAUDE.md`

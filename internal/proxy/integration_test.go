@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"ro-imap-proxy/internal/config"
-	"ro-imap-proxy/internal/imap"
+	"imap-proxy/internal/config"
+	"imap-proxy/internal/imap"
 )
 
 // integrationEnv holds the common state for an integration test session.
@@ -121,7 +121,7 @@ func (e *integrationEnv) login(t *testing.T) {
 
 	// Read greeting.
 	greeting := e.readLine(t)
-	if !strings.Contains(greeting, "* OK ro-imap-proxy ready") {
+	if !strings.Contains(greeting, "* OK imap-proxy ready") {
 		t.Fatalf("unexpected greeting: %q", greeting)
 	}
 
@@ -332,7 +332,7 @@ func TestIntegrationFullSession(t *testing.T) {
 
 	// 1. Read greeting.
 	greeting := env.readLine(t)
-	if !strings.Contains(greeting, "* OK ro-imap-proxy ready") {
+	if !strings.Contains(greeting, "* OK imap-proxy ready") {
 		t.Fatalf("unexpected greeting: %q", greeting)
 	}
 

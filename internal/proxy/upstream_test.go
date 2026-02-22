@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"ro-imap-proxy/internal/config"
+	"imap-proxy/internal/config"
 )
 
 // generateTestTLSConfigs creates a self-signed certificate and returns a server

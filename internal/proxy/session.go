@@ -9,8 +9,8 @@ import (
 	"strings"
 	"sync"
 
-	"ro-imap-proxy/internal/config"
-	"ro-imap-proxy/internal/imap"
+	"imap-proxy/internal/config"
+	"imap-proxy/internal/imap"
 )
 
 // SessionState represents the current state of an IMAP session.
@@ -58,7 +58,7 @@ func (s *Session) Run() {
 	defer s.clientConn.Close()
 
 	// 1. Send greeting.
-	if _, err := fmt.Fprint(s.clientConn, "* OK ro-imap-proxy ready\r\n"); err != nil {
+	if _, err := fmt.Fprint(s.clientConn, "* OK imap-proxy ready\r\n"); err != nil {
 		s.logger.Error("failed to send greeting", "err", err)
 		return
 	}
@@ -89,7 +89,7 @@ func (s *Session) Run() {
 			fmt.Fprintf(s.clientConn, "%s OK NOOP completed\r\n", cmd.Tag)
 
 		case "LOGOUT":
-			fmt.Fprintf(s.clientConn, "* BYE ro-imap-proxy logging out\r\n")
+			fmt.Fprintf(s.clientConn, "* BYE imap-proxy logging out\r\n")
 			fmt.Fprintf(s.clientConn, "%s OK LOGOUT completed\r\n", cmd.Tag)
 			return
 
@@ -260,7 +260,7 @@ func (s *Session) clientToUpstream() {
 
 		// Handle LOGOUT in post-auth: respond locally and let cleanup close upstream.
 		if cmd.Verb == "LOGOUT" {
-			fmt.Fprintf(s.clientConn, "* BYE ro-imap-proxy logging out\r\n")
+			fmt.Fprintf(s.clientConn, "* BYE imap-proxy logging out\r\n")
 			fmt.Fprintf(s.clientConn, "%s OK LOGOUT completed\r\n", cmd.Tag)
 			return
 		}

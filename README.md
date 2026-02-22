@@ -1,4 +1,4 @@
-# ro-imap-proxy
+# imap-proxy
 
 An IMAP proxy that maps local credentials to upstream IMAP servers. By default all mailboxes are read-only — mutating commands are blocked and `SELECT` is rewritten to `EXAMINE`. Per-account writable folders can be configured to allow drafts and flag changes where needed.
 
@@ -42,7 +42,7 @@ All other mutating commands (COPY, MOVE, DELETE, EXPUNGE, CREATE, RENAME, etc.) 
 ## Building
 
 ```
-go build ./cmd/ro-imap-proxy/
+go build ./cmd/imap-proxy/
 ```
 
 ## Configuration
@@ -77,7 +77,7 @@ Validation rules:
 ## Usage
 
 ```
-./ro-imap-proxy -config config.toml
+./imap-proxy -config config.toml
 ```
 
 The `-config` flag defaults to `config.toml` in the current directory.

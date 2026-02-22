@@ -1,4 +1,4 @@
-module ro-imap-proxy
+module imap-proxy
 
 go 1.25.0
 
