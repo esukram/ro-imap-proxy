@@ -145,6 +145,85 @@ blocked_folders = ["Trash"]
 			wantErr: true,
 		},
 		{
+			name: "writable folder in block list",
+			content: `
+[server]
+listen = ":143"
+
+[[accounts]]
+local_user = "u1"
+local_password = "p1"
+remote_host = "h"
+remote_port = 143
+remote_user = "ru"
+remote_password = "rp"
+blocked_folders = ["Drafts"]
+writable_folders = ["Drafts"]
+`,
+			wantErr: true,
+		},
+		{
+			name: "writable folder not in allow list",
+			content: `
+[server]
+listen = ":143"
+
+[[accounts]]
+local_user = "u1"
+local_password = "p1"
+remote_host = "h"
+remote_port = 143
+remote_user = "ru"
+remote_password = "rp"
+allowed_folders = ["INBOX", "Sent"]
+writable_folders = ["Drafts"]
+`,
+			wantErr: true,
+		},
+		{
+			name: "writable folder in allow list",
+			content: `
+[server]
+listen = ":143"
+
+[[accounts]]
+local_user = "u1"
+local_password = "p1"
+remote_host = "h"
+remote_port = 143
+remote_user = "ru"
+remote_password = "rp"
+allowed_folders = ["INBOX", "Sent", "Drafts"]
+writable_folders = ["Drafts"]
+`,
+			check: func(t *testing.T, cfg *Config) {
+				if !cfg.Accounts[0].FolderWritable("Drafts") {
+					t.Error("expected Drafts to be writable")
+				}
+			},
+		},
+		{
+			name: "writable folder no folder filter",
+			content: `
+[server]
+listen = ":143"
+
+[[accounts]]
+local_user = "u1"
+local_password = "p1"
+remote_host = "h"
+remote_port = 143
+remote_user = "ru"
+remote_password = "rp"
+writable_folders = ["Drafts"]
+`,
+			check: func(t *testing.T, cfg *Config) {
+				if !cfg.Accounts[0].FolderWritable("Drafts") {
+					t.Error("expected Drafts to be writable")
+				}
+			},
+		},
+		{
 			name: "no TLS flags both false is valid",
 			content: `
 [server]
@@ -282,6 +361,31 @@ func TestFolderAllowed(t *testing.T) {
 			got := tt.acct.FolderAllowed(tt.folder)
 			if got != tt.want {
 				t.Errorf("FolderAllowed(%q) = %v, want %v", tt.folder, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFolderWritable(t *testing.T) {
+	tests := []struct {
+		name   string
+		acct   AccountConfig
+		folder string
+		want   bool
+	}{
+		{"no writable folders", AccountConfig{}, "INBOX", false},
+		{"exact match", AccountConfig{WritableFolders: []string{"Drafts"}}, "Drafts", true},
+		{"no match", AccountConfig{WritableFolders: []string{"Drafts"}}, "INBOX", false},
+		{"child match", AccountConfig{WritableFolders: []string{"Drafts"}}, "Drafts/Sub", true},
+		{"INBOX normalization", AccountConfig{WritableFolders: []string{"inbox"}}, "INBOX", true},
+		{"empty string", AccountConfig{WritableFolders: []string{"Drafts"}}, "", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.acct.FolderWritable(tt.folder)
+			if got != tt.want {
+				t.Errorf("FolderWritable(%q) = %v, want %v", tt.folder, got, tt.want)
 			}
 		})
 	}

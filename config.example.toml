@@ -14,3 +14,6 @@ remote_tls = true
 # Folder visibility (only one of these may be set per account):
 # allowed_folders = ["INBOX", "Sent"]    # only these folders visible
 # blocked_folders = ["Spam", "Trash"]    # these folders hidden
+
+# Writable folders (APPEND, STORE, UID STORE, SELECT allowed):
+# writable_folders = ["Drafts"]          # must pass folder filter if set
