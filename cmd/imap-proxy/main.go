@@ -7,8 +7,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"ro-imap-proxy/internal/config"
-	"ro-imap-proxy/internal/proxy"
+	"imap-proxy/internal/config"
+	"imap-proxy/internal/proxy"
 )
 
 func main() {
@@ -23,7 +23,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	logger.Info("starting ro-imap-proxy", "listen", cfg.Server.Listen, "accounts", len(cfg.Accounts))
+	logger.Info("starting imap-proxy", "listen", cfg.Server.Listen, "accounts", len(cfg.Accounts))
 
 	srv := proxy.NewServer(cfg, logger)
 

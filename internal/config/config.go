@@ -26,8 +26,9 @@ type AccountConfig struct {
 	RemoteTLS      bool   `toml:"remote_tls"`
 	RemoteStartTLS bool   `toml:"remote_starttls"`
 
-	AllowedFolders []string `toml:"allowed_folders"`
-	BlockedFolders []string `toml:"blocked_folders"`
+	AllowedFolders  []string `toml:"allowed_folders"`
+	BlockedFolders  []string `toml:"blocked_folders"`
+	WritableFolders []string `toml:"writable_folders"`
 }
 
 // Load reads a TOML config file from path, validates it, and returns the Config.
@@ -51,6 +52,12 @@ func Load(path string) (*Config, error) {
 		if len(acct.AllowedFolders) > 0 && len(acct.BlockedFolders) > 0 {
 			return nil, fmt.Errorf("config: account %q: allowed_folders and blocked_folders cannot both be set", cfg.Accounts[i].LocalUser)
 		}
+
+		for _, wf := range acct.WritableFolders {
+			if !acct.FolderAllowed(wf) {
+				return nil, fmt.Errorf("config: account %q: writable folder %q is not allowed by folder filter", acct.LocalUser, wf)
+			}
+		}
 	}
 
 	return &cfg, nil
@@ -70,6 +77,11 @@ func (a *AccountConfig) FolderAllowed(name string) bool {
 		return !matchesAny(name, a.BlockedFolders)
 	}
 	return true
+}
+
+// FolderWritable reports whether the named folder is writable for this account.
+func (a *AccountConfig) FolderWritable(name string) bool {
+	return matchesAny(name, a.WritableFolders)
 }
 
 func matchesAny(name string, entries []string) bool {

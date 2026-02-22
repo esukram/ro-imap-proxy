@@ -9,8 +9,8 @@ import (
 	"strings"
 	"sync"
 
-	"ro-imap-proxy/internal/config"
-	"ro-imap-proxy/internal/imap"
+	"imap-proxy/internal/config"
+	"imap-proxy/internal/imap"
 )
 
 // SessionState represents the current state of an IMAP session.
@@ -35,6 +35,8 @@ type Session struct {
 	config       *config.Config
 	logger       *slog.Logger
 
+	selectedFolder string // current mailbox from SELECT/EXAMINE
+
 	// dialUpstream allows tests to inject a fake dialer.
 	dialUpstream func(acct *config.AccountConfig) (net.Conn, *bufio.Reader, error)
 }
@@ -56,7 +58,7 @@ func (s *Session) Run() {
 	defer s.clientConn.Close()
 
 	// 1. Send greeting.
-	if _, err := fmt.Fprint(s.clientConn, "* OK ro-imap-proxy ready\r\n"); err != nil {
+	if _, err := fmt.Fprint(s.clientConn, "* OK imap-proxy ready\r\n"); err != nil {
 		s.logger.Error("failed to send greeting", "err", err)
 		return
 	}
@@ -87,7 +89,7 @@ func (s *Session) Run() {
 			fmt.Fprintf(s.clientConn, "%s OK NOOP completed\r\n", cmd.Tag)
 
 		case "LOGOUT":
-			fmt.Fprintf(s.clientConn, "* BYE ro-imap-proxy logging out\r\n")
+			fmt.Fprintf(s.clientConn, "* BYE imap-proxy logging out\r\n")
 			fmt.Fprintf(s.clientConn, "%s OK LOGOUT completed\r\n", cmd.Tag)
 			return
 
@@ -258,12 +260,14 @@ func (s *Session) clientToUpstream() {
 
 		// Handle LOGOUT in post-auth: respond locally and let cleanup close upstream.
 		if cmd.Verb == "LOGOUT" {
-			fmt.Fprintf(s.clientConn, "* BYE ro-imap-proxy logging out\r\n")
+			fmt.Fprintf(s.clientConn, "* BYE imap-proxy logging out\r\n")
 			fmt.Fprintf(s.clientConn, "%s OK LOGOUT completed\r\n", cmd.Tag)
 			return
 		}
 
 		result := imap.Filter(cmd)
+		result = s.applyWritableOverride(cmd, result)
+
 		switch result.Action {
 		case imap.Allow:
 			if s.folderBlocked(cmd) {
@@ -273,6 +277,7 @@ func (s *Session) clientToUpstream() {
 			if err := s.forwardWithLiterals([]byte(line)); err != nil {
 				return
 			}
+			s.trackSelectedFolder(cmd)
 
 		case imap.Block:
 			s.logger.Warn("blocked command", "verb", cmd.Verb)
@@ -292,6 +297,7 @@ func (s *Session) clientToUpstream() {
 			if err := s.forwardWithLiterals(result.Rewritten); err != nil {
 				return
 			}
+			s.trackSelectedFolder(cmd)
 		}
 	}
 }
@@ -353,6 +359,52 @@ func (s *Session) forwardWithLiterals(line []byte) error {
 	}
 }
 
+// trackSelectedFolder updates the session's selected folder when a
+// SELECT or EXAMINE command is forwarded to upstream.
+func (s *Session) trackSelectedFolder(cmd imap.Command) {
+	switch cmd.Verb {
+	case "SELECT", "EXAMINE":
+		s.selectedFolder = extractCommandMailbox(cmd)
+	}
+}
+
+// applyWritableOverride checks if a Block or Rewrite result should be
+// overridden because the target folder is writable. Only STORE, UID STORE,
+// APPEND, and SELECT are eligible for override.
+func (s *Session) applyWritableOverride(cmd imap.Command, result imap.FilterResult) imap.FilterResult {
+	if s.account == nil || len(s.account.WritableFolders) == 0 {
+		return result
+	}
+
+	switch result.Action {
+	case imap.Block:
+		switch {
+		case cmd.Verb == "STORE":
+			if s.account.FolderWritable(s.selectedFolder) {
+				return imap.FilterResult{Action: imap.Allow}
+			}
+		case cmd.Verb == "UID" && cmd.SubVerb == "STORE":
+			if s.account.FolderWritable(s.selectedFolder) {
+				return imap.FilterResult{Action: imap.Allow}
+			}
+		case cmd.Verb == "APPEND":
+			mailbox := extractAppendMailbox(cmd)
+			if mailbox != "" && s.account.FolderWritable(mailbox) {
+				return imap.FilterResult{Action: imap.Allow}
+			}
+		}
+	case imap.Rewrite:
+		if cmd.Verb == "SELECT" {
+			mailbox := extractCommandMailbox(cmd)
+			if mailbox != "" && s.account.FolderWritable(mailbox) {
+				return imap.FilterResult{Action: imap.Allow}
+			}
+		}
+	}
+
+	return result
+}
+
 // folderBlocked checks if the command targets a folder that is hidden by the
 // account's folder filter. Returns true if the command should be rejected.
 func (s *Session) folderBlocked(cmd imap.Command) bool {
@@ -361,14 +413,26 @@ func (s *Session) folderBlocked(cmd imap.Command) bool {
 	}
 	switch cmd.Verb {
 	case "SELECT", "EXAMINE", "STATUS":
+		mailbox := extractCommandMailbox(cmd)
+		if mailbox == "" {
+			return false
+		}
+		return !s.account.FolderAllowed(mailbox)
+	case "APPEND":
+		mailbox := extractAppendMailbox(cmd)
+		if mailbox == "" {
+			return false
+		}
+		return !s.account.FolderAllowed(mailbox)
 	default:
 		return false
 	}
-	mailbox := extractCommandMailbox(cmd)
-	if mailbox == "" {
-		return false
-	}
-	return !s.account.FolderAllowed(mailbox)
+}
+
+// extractAppendMailbox extracts the mailbox name from an APPEND command.
+// APPEND has the syntax: tag APPEND mailbox [flags] [date] literal
+func extractAppendMailbox(cmd imap.Command) string {
+	return extractCommandMailbox(cmd)
 }
 
 // extractCommandMailbox extracts the mailbox name argument from commands

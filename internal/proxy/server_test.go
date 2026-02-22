@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"ro-imap-proxy/internal/config"
+	"imap-proxy/internal/config"
 )
 
 // TestServerAccept verifies that the server accepts a connection and sends a greeting.

@@ -1,11 +1,11 @@
-BINARY = ro-imap-proxy
+BINARY = imap-proxy
 
 .PHONY: all build test vet clean
 
 all: clean build vet test
 
 build:
-	go build -o $(BINARY) ./cmd/ro-imap-proxy/
+	go build -o $(BINARY) ./cmd/imap-proxy/
 
 test:
 	go test ./...

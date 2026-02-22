@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"ro-imap-proxy/internal/config"
+	"imap-proxy/internal/config"
 )
 
 func testConfig() *config.Config {
@@ -54,7 +54,7 @@ func TestSessionGreeting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read greeting: %v", err)
 	}
-	if line != "* OK ro-imap-proxy ready\r\n" {
+	if line != "* OK imap-proxy ready\r\n" {
 		t.Fatalf("unexpected greeting: %q", line)
 	}
 	clientConn.Close()

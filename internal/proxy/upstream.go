@@ -7,7 +7,7 @@ import (
 	"net"
 	"strings"
 
-	"ro-imap-proxy/internal/config"
+	"imap-proxy/internal/config"
 )
 
 // DialUpstream connects to the upstream IMAP server described by acct.

@@ -3,12 +3,14 @@ package proxy
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"testing"
 	"time"
 
-	"ro-imap-proxy/internal/config"
+	"imap-proxy/internal/config"
+	"imap-proxy/internal/imap"
 )
 
 // integrationEnv holds the common state for an integration test session.
@@ -119,7 +121,7 @@ func (e *integrationEnv) login(t *testing.T) {
 
 	// Read greeting.
 	greeting := e.readLine(t)
-	if !strings.Contains(greeting, "* OK ro-imap-proxy ready") {
+	if !strings.Contains(greeting, "* OK imap-proxy ready") {
 		t.Fatalf("unexpected greeting: %q", greeting)
 	}
 
@@ -255,6 +257,16 @@ func newFolderFilterEnv(t *testing.T, modify func(*config.AccountConfig)) *integ
 
 			upper := strings.ToUpper(trimmed)
 
+			// Consume any literal data attached to this line.
+			consumeLiteral := func() {
+				n, _, hasLit := imap.ParseLiteral([]byte(line))
+				if hasLit {
+					io.CopyN(io.Discard, sr, n)
+					// Read the trailing line after the literal.
+					sr.ReadString('\n')
+				}
+			}
+
 			switch {
 			case strings.Contains(upper, " LIST"):
 				for _, lr := range folderListResponses {
@@ -268,6 +280,10 @@ func newFolderFilterEnv(t *testing.T, modify func(*config.AccountConfig)) *integ
 					fmt.Fprintf(upServer, "%s\r\n", lsub)
 				}
 				fmt.Fprintf(upServer, "%s OK LSUB completed\r\n", tag)
+
+			case strings.Contains(upper, " APPEND"):
+				consumeLiteral()
+				fmt.Fprintf(upServer, "%s OK APPEND completed\r\n", tag)
 
 			case strings.Contains(upper, " LOGOUT"):
 				fmt.Fprintf(upServer, "* BYE server logging out\r\n")
@@ -316,7 +332,7 @@ func TestIntegrationFullSession(t *testing.T) {
 
 	// 1. Read greeting.
 	greeting := env.readLine(t)
-	if !strings.Contains(greeting, "* OK ro-imap-proxy ready") {
+	if !strings.Contains(greeting, "* OK imap-proxy ready") {
 		t.Fatalf("unexpected greeting: %q", greeting)
 	}
 
@@ -681,4 +697,206 @@ func TestIntegrationNoFilterAllPassThrough(t *testing.T) {
 	if len(folders) != 7 {
 		t.Fatalf("expected 7 folders (no filter), got %d: %v", len(folders), folders)
 	}
+}
+
+// --- Writable folders integration tests ---
+
+func TestIntegrationSelectWritableFolder(t *testing.T) {
+	env := newFolderFilterEnv(t, func(a *config.AccountConfig) {
+		a.WritableFolders = []string{"Drafts"}
+	})
+	defer env.clientConn.Close()
+	env.login(t)
+
+	// SELECT on writable folder passes through as SELECT (not rewritten to EXAMINE).
+	env.send(t, "A002 SELECT Drafts\r\n")
+	upCmd := env.expectUpstream(t, "SELECT")
+	if strings.Contains(strings.ToUpper(upCmd), "EXAMINE") {
+		t.Fatalf("writable folder SELECT should NOT be rewritten to EXAMINE, got: %q", upCmd)
+	}
+	resp := env.readLine(t)
+	if !strings.Contains(resp, "A002 OK") {
+		t.Fatalf("expected SELECT OK, got: %q", resp)
+	}
+}
+
+func TestIntegrationSelectNonWritableStillRewritten(t *testing.T) {
+	env := newFolderFilterEnv(t, func(a *config.AccountConfig) {
+		a.WritableFolders = []string{"Drafts"}
+	})
+	defer env.clientConn.Close()
+	env.login(t)
+
+	// SELECT on non-writable folder still rewritten to EXAMINE.
+	env.send(t, "A002 SELECT INBOX\r\n")
+	upCmd := env.expectUpstream(t, "EXAMINE")
+	if strings.Contains(strings.ToUpper(upCmd), "SELECT") {
+		t.Fatalf("non-writable SELECT should be rewritten to EXAMINE, got: %q", upCmd)
+	}
+	resp := env.readLine(t)
+	if !strings.Contains(resp, "A002 OK") {
+		t.Fatalf("expected OK, got: %q", resp)
+	}
+}
+
+func TestIntegrationStoreInWritableFolder(t *testing.T) {
+	env := newFolderFilterEnv(t, func(a *config.AccountConfig) {
+		a.WritableFolders = []string{"Drafts"}
+	})
+	defer env.clientConn.Close()
+	env.login(t)
+
+	// SELECT writable folder first.
+	env.send(t, "A002 SELECT Drafts\r\n")
+	env.expectUpstream(t, "SELECT")
+	env.readLine(t) // OK
+
+	// STORE should be allowed.
+	env.send(t, "A003 STORE 1 +FLAGS (\\Seen)\r\n")
+	env.expectUpstream(t, "STORE")
+	resp := env.readLine(t)
+	if !strings.Contains(resp, "A003 OK") {
+		t.Fatalf("expected STORE OK in writable folder, got: %q", resp)
+	}
+}
+
+func TestIntegrationStoreInNonWritableFolder(t *testing.T) {
+	env := newFolderFilterEnv(t, func(a *config.AccountConfig) {
+		a.WritableFolders = []string{"Drafts"}
+	})
+	defer env.clientConn.Close()
+	env.login(t)
+
+	// SELECT non-writable folder (rewritten to EXAMINE).
+	env.send(t, "A002 SELECT INBOX\r\n")
+	env.expectUpstream(t, "EXAMINE")
+	env.readLine(t) // OK
+
+	// STORE should be blocked.
+	env.send(t, "A003 STORE 1 +FLAGS (\\Seen)\r\n")
+	resp := env.readLine(t)
+	if !strings.Contains(resp, "A003 NO") {
+		t.Fatalf("expected STORE blocked in non-writable folder, got: %q", resp)
+	}
+	env.noUpstream(t)
+}
+
+func TestIntegrationUIDStoreInWritableFolder(t *testing.T) {
+	env := newFolderFilterEnv(t, func(a *config.AccountConfig) {
+		a.WritableFolders = []string{"Drafts"}
+	})
+	defer env.clientConn.Close()
+	env.login(t)
+
+	// SELECT writable folder.
+	env.send(t, "A002 SELECT Drafts\r\n")
+	env.expectUpstream(t, "SELECT")
+	env.readLine(t) // OK
+
+	// UID STORE should be allowed.
+	env.send(t, "A003 UID STORE 1 +FLAGS (\\Seen)\r\n")
+	env.expectUpstream(t, "UID STORE")
+	resp := env.readLine(t)
+	if !strings.Contains(resp, "A003 OK") {
+		t.Fatalf("expected UID STORE OK in writable folder, got: %q", resp)
+	}
+}
+
+func TestIntegrationAppendToWritableFolder(t *testing.T) {
+	env := newFolderFilterEnv(t, func(a *config.AccountConfig) {
+		a.WritableFolders = []string{"Drafts"}
+	})
+	defer env.clientConn.Close()
+	env.login(t)
+
+	// APPEND to writable folder with non-sync literal.
+	// Combine command, literal data, and trailing line in one send to avoid
+	// net.Pipe deadlock (proxy writes to upstream while test writes literal).
+	msgBody := "Subject: hi\r\n\r\nHello\r\n"
+	env.send(t, fmt.Sprintf("A002 APPEND Drafts {%d+}\r\n%s\r\n", len(msgBody), msgBody))
+
+	env.expectUpstream(t, "APPEND")
+	resp := env.readLine(t)
+	if !strings.Contains(resp, "A002 OK") {
+		t.Fatalf("expected APPEND OK for writable folder, got: %q", resp)
+	}
+}
+
+func TestIntegrationAppendToNonWritableFolder(t *testing.T) {
+	env := newFolderFilterEnv(t, func(a *config.AccountConfig) {
+		a.WritableFolders = []string{"Drafts"}
+	})
+	defer env.clientConn.Close()
+	env.login(t)
+
+	// APPEND to non-writable folder with non-sync literal — should be blocked.
+	// Combine command and literal in one send to avoid net.Pipe deadlock
+	// (proxy writes rejection while test writes literal data).
+	msgBody := "Subject: hi\r\n\r\nHello\r\n"
+	env.send(t, fmt.Sprintf("A002 APPEND INBOX {%d+}\r\n%s", len(msgBody), msgBody))
+
+	resp := env.readLine(t)
+	if !strings.Contains(resp, "A002 NO") {
+		t.Fatalf("expected APPEND blocked for non-writable folder, got: %q", resp)
+	}
+	env.noUpstream(t)
+}
+
+func TestIntegrationWritableFolderOtherCommandsStillBlocked(t *testing.T) {
+	env := newFolderFilterEnv(t, func(a *config.AccountConfig) {
+		a.WritableFolders = []string{"Drafts"}
+	})
+	defer env.clientConn.Close()
+	env.login(t)
+
+	// SELECT writable folder.
+	env.send(t, "A002 SELECT Drafts\r\n")
+	env.expectUpstream(t, "SELECT")
+	env.readLine(t) // OK
+
+	// COPY, MOVE, DELETE, EXPUNGE should all still be blocked.
+	blocked := []struct {
+		name string
+		cmd  string
+	}{
+		{"COPY", "COPY 1 INBOX"},
+		{"MOVE", "MOVE 1 INBOX"},
+		{"DELETE", "DELETE Drafts"},
+		{"EXPUNGE", "EXPUNGE"},
+		{"CREATE", "CREATE NewFolder"},
+		{"RENAME", "RENAME Drafts NewDrafts"},
+	}
+
+	for i, tc := range blocked {
+		t.Run(tc.name, func(t *testing.T) {
+			tag := fmt.Sprintf("B%03d", i+1)
+			env.send(t, fmt.Sprintf("%s %s\r\n", tag, tc.cmd))
+			resp := env.readLine(t)
+			if !strings.Contains(resp, tag+" NO") {
+				t.Fatalf("expected %s blocked even in writable folder, got: %q", tc.name, resp)
+			}
+		})
+	}
+}
+
+func TestIntegrationNoWritableFoldersDefaultReadOnly(t *testing.T) {
+	env := newFolderFilterEnv(t, nil) // no writable folders
+	defer env.clientConn.Close()
+	env.login(t)
+
+	// SELECT should be rewritten to EXAMINE.
+	env.send(t, "A002 SELECT Drafts\r\n")
+	upCmd := env.expectUpstream(t, "EXAMINE")
+	if strings.Contains(strings.ToUpper(upCmd), "SELECT") {
+		t.Fatalf("without writable folders, SELECT should be rewritten, got: %q", upCmd)
+	}
+	env.readLine(t) // OK
+
+	// STORE should be blocked.
+	env.send(t, "A003 STORE 1 +FLAGS (\\Seen)\r\n")
+	resp := env.readLine(t)
+	if !strings.Contains(resp, "A003 NO") {
+		t.Fatalf("expected STORE blocked without writable folders, got: %q", resp)
+	}
+	env.noUpstream(t)
 }
